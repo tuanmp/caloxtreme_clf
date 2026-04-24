@@ -40,13 +40,19 @@ class HDF5Dataset(Dataset):
             return dataset[:0]
 
         ordered = np.asarray(indices, dtype=np.int64)
+        if ordered.size <= 1:
+            return np.asarray(dataset[ordered])
+
+        # Fast path: DataLoader often provides monotonic indices already.
+        if np.all(ordered[1:] >= ordered[:-1]):
+            return np.asarray(dataset[ordered])
+
         order = np.argsort(ordered)
         sorted_indices = ordered[order]
         data = np.asarray(dataset[sorted_indices])
 
-        if not np.array_equal(order, np.arange(len(order))):
-            inverse_order = np.argsort(order)
-            data = data[inverse_order]
+        inverse_order = np.argsort(order)
+        data = data[inverse_order]
 
         return data
 
@@ -59,10 +65,7 @@ class HDF5Dataset(Dataset):
         batch_indices = np.asarray(indices, dtype=np.int64)
 
         field_batches = [self._read_rows(handle[field], batch_indices) for field in self.fields]
-        samples = []
-        for row_idx in range(len(batch_indices)):
-            samples.append(tuple(field_batch[row_idx] for field_batch in field_batches))
-        return samples
+        return [tuple(row) for row in zip(*field_batches)]
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -136,10 +139,12 @@ class MultiHDF5Dataset(Dataset):
             handle = files[file_idx]
 
             field_batches = [HDF5Dataset._read_rows(handle[field], local_indices) for field in self.fields]
+            grouped_rows = [tuple(row) for row in zip(*field_batches)]
             for row_idx, output_position in enumerate(positions):
-                output[int(output_position)] = tuple(field_batch[row_idx] for field_batch in field_batches)
+                output[int(output_position)] = grouped_rows[row_idx]
 
-        return [sample for sample in output if sample is not None]
+        assert all(s is not None for s in output), "Some batch indices failed to resolve in MultiHDF5Dataset.__getitems__"
+        return output
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -213,6 +218,10 @@ class BaseDataModule(LightningDataModule):
     def _dataset_fields(self):
         return ("X", "cond", "y")
 
+    def _base_dataset_fields(self):
+        """Fields written by _write_subset_file. Subclasses must not override this."""
+        return ("X", "cond", "y")
+
     def _split_source_fields(self):
         return ("showers", "incident_energies")
 
@@ -271,7 +280,7 @@ class BaseDataModule(LightningDataModule):
         return data
 
     def _write_subset_file(self, source_path: str, target_path: str, indices: np.ndarray, label_value: float):
-        if self._has_fields(target_path, self._dataset_fields()):
+        if self._has_fields(target_path, self._base_dataset_fields()):
             return
 
         target = Path(target_path)
@@ -350,8 +359,8 @@ class BaseDataModule(LightningDataModule):
         rank_zero_info("Preparing data...")
 
         if not all([os.path.exists(f) for f in self.train_data_files + self.val_data_files]):
-            num_gen = lookup_hdf5(self.gen_data_path, field="showers")
-            num_truth = lookup_hdf5(self.truth_data_path, field="showers")
+            num_gen = lookup_hdf5(self.gen_data_path, field=self._split_source_fields()[0])
+            num_truth = lookup_hdf5(self.truth_data_path, field=self._split_source_fields()[0])
 
             gen_indices = np.arange(num_gen)
             truth_indices = np.arange(num_truth)
@@ -386,7 +395,7 @@ class BaseDataModule(LightningDataModule):
             rank_zero_info("Truth val data prepared and saved to {}.".format(self.val_data_files[1]))
 
         if not os.path.exists(self.test_data_files[0]):
-            test_num_entries = lookup_hdf5(self.test_data_path, field="showers")
+            test_num_entries = lookup_hdf5(self.test_data_path, field=self._split_source_fields()[0])
             test_indices = np.arange(test_num_entries)
             test_indices: np.ndarray[tuple[Any, ...], np.dtype[Any]] = self._filter_by_energy(test_indices, self.test_data_path)
             self._write_subset_file(self.test_data_path, self.test_data_files[0], test_indices, 1.0)
@@ -438,10 +447,11 @@ class BaseDataModule(LightningDataModule):
 
 
 class SimpleMLPDataModule(BaseDataModule):
-    def __init__(self, *args, use_synthetic_data: bool = False, feature_chunk_size: int = 256, **kwargs):
+    def __init__(self, *args, use_synthetic_data: bool = False, feature_chunk_size: int = 256, synthetic_hlf_dim: int = 6, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_synthetic_data = use_synthetic_data
         self.feature_chunk_size = feature_chunk_size
+        self.synthetic_hlf_dim = synthetic_hlf_dim
 
     def _dataset_fields(self):
         return ("X_proc", "cond_proc", "X_hlf", "y")
@@ -488,9 +498,11 @@ class SimpleMLPDataModule(BaseDataModule):
                 X_chunk = np.asarray(raw_X[start:stop], dtype=np.float32)
                 cond_chunk = np.asarray(raw_cond[start:stop], dtype=np.float32)
 
-                hlf_chunk = get_high_level_features(X_chunk.copy(), cond_chunk.copy(), self.xml_path, self.particle)
-                X_chunk, cond_chunk = scale_shower(X_chunk, cond_chunk)
-                X_chunk = X_chunk.reshape(X_chunk.shape[0], -1)
+                # hlf_chunk = get_high_level_features(X_chunk.copy(), cond_chunk.copy(), self.xml_path, self.particle)
+                # X_chunk, cond_chunk = scale_shower(X_chunk, cond_chunk)
+                # X_chunk = X_chunk.reshape(X_chunk.shape[0], -1)
+
+                X_chunk, cond_chunk, hlf_chunk = self._preprocess_data(X_chunk, cond_chunk)
 
                 if hlf_dataset is None:
                     hlf_example = hlf_chunk
@@ -528,16 +540,80 @@ class SimpleMLPDataModule(BaseDataModule):
 
             if stage == "fit" or stage is None:
                 train_X = torch.randn(n_samples * 2, input_dim, dtype=torch.float32)
+                train_cond = torch.randn(n_samples * 2, 1, dtype=torch.float32)
+                train_hlf = torch.randn(n_samples * 2, self.synthetic_hlf_dim, dtype=torch.float32)
                 train_y = torch.randint(0, 2, (n_samples * 2, 1), dtype=torch.float32)
                 val_X = torch.randn(n_samples // 2, input_dim, dtype=torch.float32)
+                val_cond = torch.randn(n_samples // 2, 1, dtype=torch.float32)
+                val_hlf = torch.randn(n_samples // 2, self.synthetic_hlf_dim, dtype=torch.float32)
                 val_y = torch.randint(0, 2, (n_samples // 2, 1), dtype=torch.float32)
 
-                self.train_dataset = TensorDataset(train_X, train_y)
-                self.val_dataset = TensorDataset(val_X, val_y)
+                self.train_dataset = TensorDataset(train_X, train_cond, train_hlf, train_y)
+                self.val_dataset = TensorDataset(val_X, val_cond, val_hlf, val_y)
 
             if stage == "test" or stage is None:
                 test_X = torch.randn(n_samples // 4, input_dim, dtype=torch.float32)
+                test_cond = torch.randn(n_samples // 4, 1, dtype=torch.float32)
+                test_hlf = torch.randn(n_samples // 4, self.synthetic_hlf_dim, dtype=torch.float32)
                 test_y = torch.randint(0, 2, (n_samples // 4, 1), dtype=torch.float32)
-                self.test_dataset = TensorDataset(test_X, test_y)
+                self.test_dataset = TensorDataset(test_X, test_cond, test_hlf, test_y)
         else:
             return super().setup(stage)
+
+
+class SimpleMLPLatentDataModule(SimpleMLPDataModule):
+
+    def _split_source_fields(self):
+        return ["latent_features", "incident_energies"]
+    
+    def _dataset_fields(self):
+        return ("X_proc", "cond_proc", "y")
+
+    def _preprocess_data(self, X, cond):
+        # X, cond = scale_shower(X, cond)
+        # X = X.reshape(X.shape[0], -1)
+        cond = cond.reshape(-1, 1) 
+        cond /= 1000. # convert to GeV
+
+        return X, cond
+
+    def _write_processed_fields(self, file_path: str):
+        processed_fields = self._dataset_fields()[:-1]
+        if self._has_fields(file_path, processed_fields):
+            return
+
+        with h5py.File(file_path, "a") as handle:
+            for field_name in processed_fields:
+                if field_name in handle:
+                    del handle[field_name]
+
+            raw_X = handle["X"]
+            raw_cond = handle["cond"]
+            num_entries = int(raw_X.shape[0])
+            flattened_dim = int(np.prod(raw_X.shape[1:]))
+
+            X_dataset = handle.create_dataset(
+                "X_proc",
+                shape=(num_entries, flattened_dim),
+                dtype=np.float32,
+                chunks=True,
+            )
+            cond_dataset = handle.create_dataset(
+                "cond_proc",
+                shape=(num_entries, 1),
+                dtype=np.float32,
+                chunks=True,
+            )
+
+            for start in tqdm(range(0, num_entries, self.feature_chunk_size), desc=f"Saving filtered dataset to {file_path}"):
+                stop = min(start + self.feature_chunk_size, num_entries)
+
+                X_chunk = np.asarray(raw_X[start:stop], dtype=np.float32)
+                cond_chunk = np.asarray(raw_cond[start:stop], dtype=np.float32)
+
+                X_chunk, cond_chunk = self._preprocess_data(X_chunk, cond_chunk)
+
+                X_dataset[start:stop] = X_chunk.astype(np.float32, copy=False)
+                cond_dataset[start:stop] = cond_chunk.astype(np.float32, copy=False)
+
+    

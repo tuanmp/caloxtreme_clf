@@ -93,3 +93,11 @@ class MLPHighLevelClassifier(MLPClassifier):
         X = torch.concat([X_hlf, cond_proc], dim=-1)
         y = y.unsqueeze(1)
         return X, y
+
+class MLPLatentClassifier(MLPClassifier):
+
+    def get_input_from_batch(self, batch):
+        X_proc, cond_proc, y = batch
+        X = torch.concat([X_proc, cond_proc], dim=-1)
+        y = y.reshape(-1, 1)
+        return X, y

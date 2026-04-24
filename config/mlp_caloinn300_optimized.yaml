@@ -1,0 +1,81 @@
+model:
+  class_path: module.lightning.MLPClassifier
+  init_args:
+    hidden_dim: 512
+    num_layers: 5
+    batch_norm: true
+    layer_norm: false
+    output_dim: 1
+    dropout: 0.5
+    activation: relu
+
+data:
+  class_path: data.datamodule.SimpleMLPDataModule
+  init_args:
+    gen_data_path: /global/cfs/cdirs/m3443/usr/pmtuan/CaloINN/results/20260416_144506_full_training_odd_good_order/sample_train_clf_epoch300.hdf5
+    truth_data_path: /pscratch/sd/p/pmtuan/ddsim/single_pion_discrete_validation_coarse_hcal/trainset_flat_good_order.hdf5
+    # test_data_path: /pscratch/sd/p/pmtuan/ddsim/single_pion_discrete_extrapolation_coarse_hcal/trainset_flat_good_order.hdf5
+    test_data_path: /pscratch/sd/p/pmtuan/ddsim/single_pion_discrete_coarse_hcal/trainset_flat_good_order.hdf5
+    xml_path: /global/cfs/cdirs/m3443/usr/pmtuan/caloinn_lightning/binning_pion_odd_coarse_hcal.xml
+    particle: pion
+    val_fraction: 0.05
+    batch_size: 8192
+    min_energy: 9500
+    split_chunk_size: 50000
+    num_workers: 12
+    prefetch_factor: 100
+    pin_memory: true
+    use_lazy_hdf5: true
+
+optimizer:
+  class_path: torch.optim.AdamW
+  init_args:
+    lr: 0.001
+    betas: [0.9, 0.999]
+    eps: 1e-8
+    amsgrad: true
+
+lr_scheduler:
+  class_path: torch.optim.lr_scheduler.StepLR
+  init_args:
+    step_size: 10
+    gamma: 0.95
+
+trainer:
+  stage_dir: /pscratch/sd/p/pmtuan/caloxtreme_clf/
+  # run_name: mlp_caloinn300_test
+  accelerator: auto
+  devices: 1
+  num_nodes: 1
+  max_epochs: 100
+  logger:
+  - class_path: training_utils.wandb.WandbLogger
+    init_args:
+      stage_dir: /pscratch/sd/p/pmtuan/caloxtreme_clf
+      project: caloxtreme_mlp
+      group: simple_mlp_sim_truth
+
+  # - class_path: lightning.pytorch.loggers.mlflow.MLFlowLogger
+  #   init_args:
+  #     save_dir: /pscratch/sd/p/pmtuan/caloxtreme_clf/
+  #     experiment_name: caloxtreme_mlp
+  #     log_model: true
+  #     artifact_location: /pscratch/sd/p/pmtuan/caloxtreme_clf/mlruns
+  #     tracking_uri: http://localhost:5000
+  callbacks:
+  - class_path: training_utils.callbacks.checkpoint.ModelCheckpointCallback
+    init_args:
+      stage_dir: /pscratch/sd/p/pmtuan/caloxtreme_clf
+      monitor: val_loss
+      mode: min
+      save_top_k: 1
+      save_last: true
+      verbose: true
+  - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+    init_args:
+      logging_interval: epoch
+  - class_path: lightning.pytorch.callbacks.EarlyStopping
+    init_args:
+      monitor: val_loss
+      mode: min
+      patience: 10

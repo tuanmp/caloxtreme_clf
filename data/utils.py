@@ -1,5 +1,6 @@
 import h5py 
 import numpy as np
+from functools import lru_cache
 from data.HighLevelFeatures import HighLevelFeatures
 
 def read_hdf5(data_path, fields: list[str], indices=None):
@@ -19,12 +20,16 @@ def scale_shower(X, cond):
 
     cond = cond.reshape(-1, 1)
     X /= cond
-    cond /= 1000 # convert to GeV
+    cond /= 1000. # convert to GeV
 
     return X, cond
 
+@lru_cache(maxsize=8)
+def _get_hlf_extractor(particle: str, xml_path: str) -> HighLevelFeatures:
+    return HighLevelFeatures(particle, xml_path)
+
 def get_high_level_features(X, cond, xml_path, particle):
-    hlf = HighLevelFeatures(particle, xml_path)
+    hlf = _get_hlf_extractor(particle, xml_path)
     setattr(hlf, "Einc", cond)
     hlf.CalculateFeatures(X)
     hlf_features = [
@@ -40,3 +45,9 @@ def get_high_level_features(X, cond, xml_path, particle):
     hlf_features = np.stack(hlf_features, axis=1, dtype=np.float32)
 
     return hlf_features
+
+def prepare_gen_latent(cond, X_dim):
+    num_entries = cond.shape[0]
+    gen_latent = np.random.normal(size=(num_entries, X_dim)).astype(np.float32)
+    return gen_latent
+
