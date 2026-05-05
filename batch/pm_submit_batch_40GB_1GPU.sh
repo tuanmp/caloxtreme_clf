@@ -8,7 +8,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=32
-#SBATCH --time=08:00:00
+#SBATCH --time=24:00:00
 #SBATCH --signal=SIGUSR1@240
 #SBATCH --requeue
 #SBATCH --gpu-bind=none
@@ -22,6 +22,6 @@ echo -e "\nStarting Training with argument $@\n"
 
 mkdir -p slurm_logs
 
-srun $@
+chmod +x batch/payload.sh
 
-wait
+srun batch/payload.sh $@

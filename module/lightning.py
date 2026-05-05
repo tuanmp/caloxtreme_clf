@@ -1,11 +1,19 @@
+from typing import Any
+
 from lightning import LightningModule
 import torch.nn.functional as F
 from module.classifier import MLP
 import torch
+from sklearn.metrics import roc_auc_score
+from torchmetrics import AUROC, MetricCollection
 
 class BaseModel(LightningModule):
     def __init__(self):
         super().__init__()
+
+        self.metrics = MetricCollection({
+            "auroc": AUROC(task="binary"),
+        })
 
     def criterion(self, y_hat, y):
         return F.binary_cross_entropy_with_logits(y_hat, y, reduction='mean')
@@ -19,13 +27,14 @@ class BaseModel(LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y = self.get_input_from_batch(batch)
-
         if y.dim() == 1:
             y = y.unsqueeze(1)
         y_hat = self(x)
         loss = self.criterion(y_hat, y)
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        return loss
+        return {"loss": loss}
+    
+    def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
+        self.log('train_loss', outputs["loss"], on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
     def validation_step(self, batch, batch_idx):
         x, y = self.get_input_from_batch(batch)
@@ -33,8 +42,22 @@ class BaseModel(LightningModule):
             y = y.unsqueeze(1)
         y_hat = self(x)
         loss = self.criterion(y_hat, y)
-        self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        return loss
+        return {
+            "loss": loss,
+            "y_hat": y_hat.detach(),
+            "y": y.detach(),
+        }
+    
+    def on_validation_batch_end(self, outputs, batch, batch_idx: int, dataloader_idx: int = 0) -> None:
+        # update metrics
+        y_hat = outputs["y_hat"]
+        y = outputs["y"]
+        self.log('val_loss', outputs["loss"], on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.metrics.update(y_hat, y)
+    
+    def on_validation_epoch_end(self) -> None:
+        self.log("val_aucroc", self.metrics["auroc"].compute(), on_epoch=True, prog_bar=True, logger=True)
+        self.metrics.reset()
 
     def test_step(self, batch, batch_idx):
         x, y = self.get_input_from_batch(batch)

@@ -9,6 +9,27 @@ wheels/
 # Virtual environments
 .venv
 
+# vscode
+.vscode/
+
 # all hdf5 data files
 *.hdf5
 *.h5
+
+# all pdf files
+*.pdf
+
+# all png files
+*.png
+
+slurm_logs/
+
+# caches
+__pycache__/
+*cache*/
+
+# env
+.env/
+
+# artifacts
+checkpoints/

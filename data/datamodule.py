@@ -16,6 +16,9 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 from data.utils import get_high_level_features, lookup_hdf5, scale_shower
 from tqdm import tqdm
 
+_H5_RDCC = {"rdcc_nbytes": 64 * 1024 * 1024, "rdcc_nslots": 4093}
+_H5_ROW_CHUNK = 1024
+
 
 class HDF5Dataset(Dataset):
     def __init__(self, file_path: str, fields: tuple[str, ...]):
@@ -31,7 +34,7 @@ class HDF5Dataset(Dataset):
 
     def _get_file(self):
         if self._file is None:
-            self._file = h5py.File(self.file_path, "r")
+            self._file = h5py.File(self.file_path, "r", **_H5_RDCC)
         return self._file
 
     @staticmethod
@@ -104,7 +107,7 @@ class MultiHDF5Dataset(Dataset):
 
     def _get_files(self):
         if self._files is None:
-            self._files = [h5py.File(file_path, "r") for file_path in self.file_paths]
+            self._files = [h5py.File(file_path, "r", **_H5_RDCC) for file_path in self.file_paths]
         return self._files
 
     def _locate_index(self, index: int):
@@ -182,6 +185,7 @@ class BaseDataModule(LightningDataModule):
         split_chunk_size: int = 100000,
         use_lazy_hdf5: bool = False,
         min_energy: Optional[float] = None,
+        voxel_energy_cutoff: Optional[float] = None,
     ):
         super().__init__()
         self.gen_data_path = gen_data_path
@@ -198,21 +202,23 @@ class BaseDataModule(LightningDataModule):
         self.split_chunk_size = split_chunk_size
         self.use_lazy_hdf5 = use_lazy_hdf5
         self.min_energy = min_energy
+        self.voxel_energy_cutoff = voxel_energy_cutoff
 
         # Generate threshold-specific split filenames to prevent stale cache reuse
         energy_suffix = "" if min_energy is None else f"_e{int(min_energy)}"
+        voxel_cutoff_suffix = "" if voxel_energy_cutoff is None else f"_voxelE{int(voxel_energy_cutoff)}"
         self.train_data_files = [
-            self.gen_data_path.replace(".hdf5", f"{energy_suffix}_train.hdf5"),
-            self.truth_data_path.replace(".hdf5", f"{energy_suffix}_train.hdf5"),
+            self.gen_data_path.replace(".hdf5", f"{energy_suffix}{voxel_cutoff_suffix}_train.hdf5"),
+            self.truth_data_path.replace(".hdf5", f"{energy_suffix}{voxel_cutoff_suffix}_train.hdf5"),
         ]
 
         self.val_data_files = [
-            self.gen_data_path.replace(".hdf5", f"{energy_suffix}_val.hdf5"),
-            self.truth_data_path.replace(".hdf5", f"{energy_suffix}_val.hdf5"),
+            self.gen_data_path.replace(".hdf5", f"{energy_suffix}{voxel_cutoff_suffix}_val.hdf5"),
+            self.truth_data_path.replace(".hdf5", f"{energy_suffix}{voxel_cutoff_suffix}_val.hdf5"),
         ]
 
         self.test_data_files = [
-            self.test_data_path.replace(".hdf5", f"{energy_suffix}_test.hdf5"),
+            self.test_data_path.replace(".hdf5", f"{energy_suffix}{voxel_cutoff_suffix}_test.hdf5"),
         ]
 
     def _dataset_fields(self):
@@ -283,6 +289,7 @@ class BaseDataModule(LightningDataModule):
         if self._has_fields(target_path, self._base_dataset_fields()):
             return
 
+        indices = np.sort(indices)
         target = Path(target_path)
         target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -290,33 +297,111 @@ class BaseDataModule(LightningDataModule):
             source_X = source[self._split_source_fields()[0]]
             source_cond = source[self._split_source_fields()[1]]
             num_entries = int(len(indices))
+            x_chunks = (_H5_ROW_CHUNK,) + source_X.shape[1:]
+            cond_chunks = (_H5_ROW_CHUNK,) + source_cond.shape[1:]
 
             X_dataset = destination.create_dataset(
                 "X",
                 shape=(num_entries,) + source_X.shape[1:],
                 dtype=np.float32,
-                chunks=True,
+                chunks=x_chunks,
+                compression="lzf",
             )
             cond_dataset = destination.create_dataset(
                 "cond",
                 shape=(num_entries,) + source_cond.shape[1:],
                 dtype=np.float32,
-                chunks=True,
+                chunks=cond_chunks,
+                compression="lzf",
             )
             y_dataset = destination.create_dataset(
                 "y",
                 shape=(num_entries,),
                 dtype=np.float32,
-                chunks=True,
+                chunks=(_H5_ROW_CHUNK,),
             )
 
             for start in tqdm(range(0, num_entries, self.split_chunk_size), desc=f"Writing {target_path}"):
                 stop = min(start + self.split_chunk_size, num_entries)
                 chunk_indices = indices[start:stop]
 
-                X_dataset[start:stop] = self._indexed_rows(source_X, chunk_indices).astype(np.float32, copy=False)
-                cond_dataset[start:stop] = self._indexed_rows(source_cond, chunk_indices).astype(np.float32, copy=False)
+                X_dataset[start:stop] = np.asarray(source_X[chunk_indices], dtype=np.float32)
+                cond_dataset[start:stop] = np.asarray(source_cond[chunk_indices], dtype=np.float32)
                 y_dataset[start:stop] = np.full(stop - start, label_value, dtype=np.float32)
+
+    def _write_two_subset_files(
+        self,
+        source_path: str,
+        target_a: str, indices_a: np.ndarray, label_a: float,
+        target_b: str, indices_b: np.ndarray, label_b: float,
+    ):
+        a_done = self._has_fields(target_a, self._base_dataset_fields())
+        b_done = self._has_fields(target_b, self._base_dataset_fields())
+
+        if a_done and b_done:
+            return
+        if a_done:
+            self._write_subset_file(source_path, target_b, indices_b, label_b)
+            return
+        if b_done:
+            self._write_subset_file(source_path, target_a, indices_a, label_a)
+            return
+
+        tags_a = np.ones(len(indices_a), dtype=bool)
+        tags_b = np.zeros(len(indices_b), dtype=bool)
+        merged_indices = np.concatenate([indices_a, indices_b])
+        merged_tags = np.concatenate([tags_a, tags_b])
+        order = np.argsort(merged_indices, kind="stable")
+        merged_indices = merged_indices[order]
+        merged_tags = merged_tags[order]
+
+        Path(target_a).parent.mkdir(parents=True, exist_ok=True)
+        Path(target_b).parent.mkdir(parents=True, exist_ok=True)
+
+        with (
+            h5py.File(source_path, "r") as source,
+            h5py.File(target_a, "w") as dest_a,
+            h5py.File(target_b, "w") as dest_b,
+        ):
+            src_X = source[self._split_source_fields()[0]]
+            src_cond = source[self._split_source_fields()[1]]
+            n_a, n_b = int(len(indices_a)), int(len(indices_b))
+            x_chunks = (_H5_ROW_CHUNK,) + src_X.shape[1:]
+            cond_chunks = (_H5_ROW_CHUNK,) + src_cond.shape[1:]
+
+            def _make_datasets(dest, n):
+                Xd = dest.create_dataset("X", shape=(n,) + src_X.shape[1:], dtype=np.float32, chunks=x_chunks, compression="lzf")
+                cd = dest.create_dataset("cond", shape=(n,) + src_cond.shape[1:], dtype=np.float32, chunks=cond_chunks, compression="lzf")
+                yd = dest.create_dataset("y", shape=(n,), dtype=np.float32, chunks=(_H5_ROW_CHUNK,))
+                return Xd, cd, yd
+
+            Xa, ca, ya = _make_datasets(dest_a, n_a)
+            Xb, cb, yb = _make_datasets(dest_b, n_b)
+
+            pos_a = pos_b = 0
+            total = len(merged_indices)
+            for start in tqdm(range(0, total, self.split_chunk_size), desc=f"Writing {Path(target_a).name} + {Path(target_b).name}"):
+                stop = min(start + self.split_chunk_size, total)
+                cidx = merged_indices[start:stop]
+                ctag = merged_tags[start:stop]
+
+                chunk_X = np.asarray(src_X[cidx], dtype=np.float32)
+                chunk_cond = np.asarray(src_cond[cidx], dtype=np.float32)
+
+                mask_a = ctag
+                mask_b = ~ctag
+                na, nb = int(mask_a.sum()), int(mask_b.sum())
+
+                if na:
+                    Xa[pos_a:pos_a + na] = chunk_X[mask_a]
+                    ca[pos_a:pos_a + na] = chunk_cond[mask_a]
+                    ya[pos_a:pos_a + na] = label_a
+                    pos_a += na
+                if nb:
+                    Xb[pos_b:pos_b + nb] = chunk_X[mask_b]
+                    cb[pos_b:pos_b + nb] = chunk_cond[mask_b]
+                    yb[pos_b:pos_b + nb] = label_b
+                    pos_b += nb
 
     def _build_lazy_dataset(self, file_paths: list[str]):
         if len(file_paths) == 1:
@@ -382,17 +467,19 @@ class BaseDataModule(LightningDataModule):
                 shuffle=True,
             )
 
-            self._write_subset_file(self.gen_data_path, self.train_data_files[0], gen_train_indices, 0.0)
-            rank_zero_info("Gen train data prepared and saved to {}.".format(self.train_data_files[0]))
+            self._write_two_subset_files(
+                self.gen_data_path,
+                self.train_data_files[0], gen_train_indices, 0.0,
+                self.val_data_files[0], gen_val_indices, 0.0,
+            )
+            rank_zero_info("Gen train/val data prepared and saved.")
 
-            self._write_subset_file(self.gen_data_path, self.val_data_files[0], gen_val_indices, 0.0)
-            rank_zero_info("Gen val data prepared and saved to {}.".format(self.val_data_files[0]))
-
-            self._write_subset_file(self.truth_data_path, self.train_data_files[1], truth_train_indices, 1.0)
-            rank_zero_info("Truth train data prepared and saved to {}.".format(self.train_data_files[1]))
-
-            self._write_subset_file(self.truth_data_path, self.val_data_files[1], truth_val_indices, 1.0)
-            rank_zero_info("Truth val data prepared and saved to {}.".format(self.val_data_files[1]))
+            self._write_two_subset_files(
+                self.truth_data_path,
+                self.train_data_files[1], truth_train_indices, 1.0,
+                self.val_data_files[1], truth_val_indices, 1.0,
+            )
+            rank_zero_info("Truth train/val data prepared and saved.")
 
         if not os.path.exists(self.test_data_files[0]):
             test_num_entries = lookup_hdf5(self.test_data_path, field=self._split_source_fields()[0])
@@ -447,7 +534,7 @@ class BaseDataModule(LightningDataModule):
 
 
 class SimpleMLPDataModule(BaseDataModule):
-    def __init__(self, *args, use_synthetic_data: bool = False, feature_chunk_size: int = 256, synthetic_hlf_dim: int = 6, **kwargs):
+    def __init__(self, *args, use_synthetic_data: bool = False, feature_chunk_size: int = 8192, synthetic_hlf_dim: int = 6, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_synthetic_data = use_synthetic_data
         self.feature_chunk_size = feature_chunk_size
@@ -457,6 +544,8 @@ class SimpleMLPDataModule(BaseDataModule):
         return ("X_proc", "cond_proc", "X_hlf", "y")
 
     def _preprocess_data(self, X, cond):
+        if self.voxel_energy_cutoff is not None:
+            X = np.where(X > self.voxel_energy_cutoff, X, 0.0)
         X_hlf = get_high_level_features(X, cond, self.xml_path, self.particle)
         X, cond = scale_shower(X, cond)
         X = X.reshape(X.shape[0], -1)
@@ -481,13 +570,14 @@ class SimpleMLPDataModule(BaseDataModule):
                 "X_proc",
                 shape=(num_entries, flattened_dim),
                 dtype=np.float32,
-                chunks=True,
+                chunks=(_H5_ROW_CHUNK, flattened_dim),
+                compression="lzf",
             )
             cond_dataset = handle.create_dataset(
                 "cond_proc",
                 shape=(num_entries, 1),
                 dtype=np.float32,
-                chunks=True,
+                chunks=(_H5_ROW_CHUNK, 1),
             )
             hlf_example = None
             hlf_dataset = None
@@ -510,7 +600,7 @@ class SimpleMLPDataModule(BaseDataModule):
                         "X_hlf",
                         shape=(num_entries, hlf_example.shape[1]),
                         dtype=np.float32,
-                        chunks=True,
+                        chunks=(_H5_ROW_CHUNK, hlf_example.shape[1]),
                     )
 
                 X_dataset[start:stop] = X_chunk.astype(np.float32, copy=False)
@@ -596,13 +686,14 @@ class SimpleMLPLatentDataModule(SimpleMLPDataModule):
                 "X_proc",
                 shape=(num_entries, flattened_dim),
                 dtype=np.float32,
-                chunks=True,
+                chunks=(_H5_ROW_CHUNK, flattened_dim),
+                compression="lzf",
             )
             cond_dataset = handle.create_dataset(
                 "cond_proc",
                 shape=(num_entries, 1),
                 dtype=np.float32,
-                chunks=True,
+                chunks=(_H5_ROW_CHUNK, 1),
             )
 
             for start in tqdm(range(0, num_entries, self.feature_chunk_size), desc=f"Saving filtered dataset to {file_path}"):
