@@ -2,8 +2,6 @@
 
 Binary classifier for calorimeter showers, built with PyTorch Lightning and configured via LightningCLI.
 
-Ce projet entraine un classifieur binaire sur des donnees calorimetriques (generees vs truth) avec un workflow base sur des fichiers YAML.
-
 ## TL;DR
 
 - Main training entrypoint: [main.py](main.py)
@@ -152,6 +150,42 @@ Reduce `data.init_args.batch_size` and/or switch to fewer workers.
 4. No artifacts where expected
 
 Confirm `trainer.stage_dir` and whether you are running under Slurm interactive vs batch mode, since output folder naming differs.
+
+## Advanced: Classifier-based Shower Resampling
+
+After training a classifier, you can use it to reweight simulated events to match the truth distribution:
+
+```bash
+cd scripts/
+uv run python resample_classifier.py \
+  --config ../config/mlp_caloinn300.yaml \
+  --checkpoint ../checkpoints/caloinn300/mlp-epoch=25-val_loss=0.38819.ckpt \
+  --output resampled_showers.hdf5 \
+  --plots ./diagnostic_plots \
+  --seed 42
+```
+
+**Key Arguments:**
+
+- `--config`: YAML config (source of truth/sim data paths)
+- `--checkpoint`: Trained classifier checkpoint
+- `--output`: Path to save resampled HDF5 (default: `resampled_showers.hdf5`)
+- `--plots`: Directory for diagnostic plots (optional)
+- `--max-score`: Calibrated score clipping threshold (default: `0.95`)
+- `--seed`: Random seed for reproducibility (optional)
+- `--device`: `cuda` or `cpu` (default: `cuda`)
+
+**Output:**
+
+- `resampled_showers.hdf5`: Resampled showers with matching high-level features to truth
+- `resampled_showers.json`: Metadata (AUC scores, retention rate)
+- Diagnostic plots:
+  - `predictions_histogram.png`: Raw vs calibrated distributions
+  - `roc_curves.png`: ROC curves before/after calibration
+  - `calibration_curves.png`: Reliability diagrams
+  - `hlf_comparison.png`: Feature-by-feature histograms with ratios
+
+See [scripts/resample_classifier.py](scripts/resample_classifier.py) for full documentation.
 
 ## Notes
 
